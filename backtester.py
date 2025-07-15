@@ -17,22 +17,26 @@ def backtest(ticker, csv_path, balance_allocated, term, risk_control):
         )
         df["ATR"] = df["TR"].rolling(14).mean()
 
-    def findSA(): # Slippage Adjustment (in %)
+    def findSA(): # Slippage Adjustment
         df["Prop. Range"] = (df["High"] - df["Low"]) / df["Close"]
         df["Avg. Volume"] = df["Volume"].rolling(30).mean()
+        df.loc[df.index[:29], "Avg. Volume"] = 1 #placeholder; day 1-29 are not included in analysis anyway
         df["Norm. Volume"] =  df[["Volume", "Avg. Volume"]].apply(
-            lambda row: row["Volume"] / max(row["Avg. Volume"], 1), axis=1) 
+            lambda row: max(0.001, row["Volume"] / row["Avg. Volume"]), axis=1)
+            # Limiting lower bound to 0.001 avoids division by 0, or unusual cases where
+            # volume is 0 but somehow high and low are not.
 
         control_bias = 0.1
         df["SA"] = df[["Prop. Range", "Norm. Volume"]].apply(
-            lambda row: control_bias * row["Prop. Range"] / row["Norm. Volume"], axis=1)
-        df["SA"] = df["SA"].apply(lambda sa: max(0.2, min(sa, 2)))
+            lambda row: control_bias * row["Prop. Range"] / row["Norm. Volume"] / 100, axis=1)
+        df["SA"] = df["SA"].apply(lambda sa: max(0.0005, min(sa, 0.05)))
 
-    # Receive all data needed
+    # Get all data needed
     df = pandas.read_csv(csv_path, parse_dates=["Date"], index_col="Date")
     df = df[~df.index.duplicated(keep='first')]
-    short = 20 if term == "short" else 50
-    long = 50 if term == "short" else 200
+    if term.upper() == "SHORT":
+        short, long = 20, 50
+    else: short, long = 50, 200
     shortSMA_label = f"SMA {short}"
     longSMA_label = f"SMA {long}"
     df[shortSMA_label] = df["Close"].rolling(short).mean()
@@ -42,7 +46,8 @@ def backtest(ticker, csv_path, balance_allocated, term, risk_control):
     df = df[long:]
 
     # Simulate buying and selling stocks with 1-cent fee per share bought and slippage
-    net_change = 0
+    dynamic_balance = balance_allocated   # apply every win/loss to dynamic_balance and work with it
+    highest_win = highest_loss = 0   # keep track of best win and worst loss
     yesterday = df.index[0]
     buyDate, matchDate = None, []
     for today in df.index[1:]:
@@ -52,20 +57,20 @@ def backtest(ticker, csv_path, balance_allocated, term, risk_control):
         yesterday_shortSMA = df.loc[yesterday, shortSMA_label]
         yesterday_longSMA = df.loc[yesterday, longSMA_label]
 
-        if (not buyDate) and today_shortSMA > today_longSMA and yesterday_shortSMA <= yesterday_longSMA:
-            buyPrice = df.loc[today, "Close"] * (1 + df.loc[today, "SA"] / 100) + 0.01
-            buyVolume = balance_allocated // buyPrice
+        if (not buyDate) and today_shortSMA >= today_longSMA and yesterday_shortSMA <= yesterday_longSMA:
+            buyPrice = df.loc[today, "Close"] * (1 + df.loc[today, "SA"]) + 0.01
+            buyVolume = dynamic_balance // buyPrice
             if buyVolume != 0:
                 buyDate = today
 
         elif (
-            (buyDate and risk_control and df.loc[today, "Close"] < (df.loc[buyDate, "Close"] - (2 * df.loc[today, "ATR"])))
-            or (buyDate and today_shortSMA < today_longSMA and yesterday_shortSMA >= yesterday_longSMA)
+            (buyDate and risk_control and df.loc[today, "Close"] <= (df.loc[buyDate, "Close"] - (2 * df.loc[today, "ATR"])))
+            or (buyDate and today_shortSMA <= today_longSMA and yesterday_shortSMA >= yesterday_longSMA)
         ):
             matchDate.append((buyDate, today))
             buyDate = None
-            sellPrice = df.loc[today, "Close"]*(1 - df.loc[today, "SA"] / 100)
-            net_change += (sellPrice - buyPrice) * buyVolume
+            sellPrice = df.loc[today, "Close"] * (1 - df.loc[today, "SA"])
+            dynamic_balance += (sellPrice - buyPrice) * buyVolume
 
         yesterday = today
 
@@ -80,11 +85,15 @@ def backtest(ticker, csv_path, balance_allocated, term, risk_control):
     # Buy/sell and win/loss labels
     for buy, sell in matchDate:
 
+        # markers
         buy_price, sell_price = df.loc[buy, "Close"], df.loc[sell, "Close"]
-        net_change_percent = ((sell_price - buy_price) / buy_price) * 100
         plt.scatter(buy, buy_price, marker="^", color="green", label="Buy")
         plt.scatter(sell, sell_price, marker="^", color="red", label="Sell")
 
+        # win/loss label
+        net_change_percent = ((sell_price - buy_price) / buy_price) * 100
+        highest_win = max(highest_win, net_change_percent)
+        highest_loss = min(highest_loss, net_change_percent)
         mid_date = buy + (sell - buy) / 2
         mid_price = (buy_price + sell_price) / 2
         label = f"{net_change_percent:+.2f}%"
@@ -116,10 +125,19 @@ def backtest(ticker, csv_path, balance_allocated, term, risk_control):
     plt.ylabel("Price (USD)")
     plt.grid(True)
     plt.tight_layout()
-    plt.show()
+    plt.show(block=False)
 
-    # Return result
-    return round(net_change, 3)
+    net_change_total = (dynamic_balance / balance_allocated - 1) * 100
+    stats = {
+        "term": term,
+        "risk-control": risk_control,
+        "balance-allocated": balance_allocated,
+        "final-balance": dynamic_balance,
+        "net-change": net_change_total,
+        "highest-win": highest_win,
+        "highest-loss": highest_loss
+    }
+    return stats
 
 # FOR TESTING OUTSIDE OF TERMINAL.PY:
 # HOW-TO:
@@ -135,10 +153,8 @@ net_change_short = 0
 net_change_long = 0
 for file in data_folder.iterdir():
     if file.name in ["tickerdata.json", "portfolio.json"]: continue
-    net_change_short += backtest(file.stem, pathlib.Path('Data') / file.name, 1000, "short", True)
-    net_change_long += backtest(file.stem, pathlib.Path('Data') / file.name, 1000, "long", True)
-print(f"SHORT: {net_change_short:+.3f}")
-print(f"LONG: {net_change_long:+.3f}")
+    backtest(file.stem, pathlib.Path('Data') / file.name, 1000, "short", True)
+    backtest(file.stem, pathlib.Path('Data') / file.name, 1000, "long", True)
 '''
 
 # for testing risk-control.
@@ -148,8 +164,6 @@ net_change = 0
 net_change_controlled = 0
 for file in data_folder.iterdir():
     if file.name in ["tickerdata.json", "portfolio.json"]: continue
-    net_change += backtest(file.stem, pathlib.Path('Data') / file.name, 1000, "long", False)
-    net_change_controlled += backtest(file.stem, pathlib.Path('Data') / file.name, 1000, "long", True)
-print(f"NO RISK CONTROL: {net_change:+.3f}")
-print(f"CONTROLLED: {net_change_controlled:+.3f}")
+    backtest(file.stem, pathlib.Path('Data') / file.name, 1000, "long", False)
+    backtest(file.stem, pathlib.Path('Data') / file.name, 1000, "long", True)
 '''
